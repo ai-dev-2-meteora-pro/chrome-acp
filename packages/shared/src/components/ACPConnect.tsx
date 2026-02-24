@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
 import { Button } from "./ui/button";
 import { StatusDot } from "./ui/connection-status";
@@ -11,7 +11,7 @@ import {
 } from "./ui/input-group";
 import { ACPClient, DEFAULT_SETTINGS, DisconnectRequestedError } from "../acp";
 import type { ACPSettings, ConnectionState, BrowserToolParams, BrowserToolResult } from "../acp";
-import { ChevronDown, FolderOpen, Globe, KeyRound, ScanLine, X } from "lucide-react";
+import { ChevronDown, FolderOpen, Globe, Image, KeyRound, ScanLine, X } from "lucide-react";
 import { useQRScanner, type QRCodeData } from "../hooks";
 
 // Get token from URL query param (for pre-filled URLs from server)
@@ -91,6 +91,7 @@ export function ACPConnect({
   const [error, setError] = useState<string | null>(null);
   const [isShaking, setIsShaking] = useState(false);
   const [client, setClient] = useState<ACPClient | null>(null);
+  const [maxHeight, setMaxHeight] = useState<number>(200);
   const contentRef = useRef<HTMLDivElement>(null);
   const hasAutoCollapsedRef = useRef(false);
   const pendingAutoConnectRef = useRef(false);
@@ -113,10 +114,39 @@ export function ACPConnect({
     setError(errorMsg);
   }, []);
 
-  const { isScanning, videoRef, startScanning, stopScanning } = useQRScanner({
+  const { isScanning, videoRef, startScanning, stopScanning, scanFromFile } = useQRScanner({
     onScan: handleQRScan,
     onError: handleQRError,
   });
+
+  // Recalculate maxHeight after DOM updates (when expanded or isScanning changes)
+  useLayoutEffect(() => {
+    if (expanded && contentRef.current) {
+      setMaxHeight(contentRef.current.scrollHeight);
+    }
+  }, [expanded, isScanning]);
+
+  // File input ref for album scanning
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Handle file selection from album
+  const handleFileSelect = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (file) {
+        await scanFromFile(file);
+        stopScanning(); // Close the scanner overlay after album scan
+      }
+      // Reset input to allow re-selecting the same file
+      e.target.value = "";
+    },
+    [scanFromFile, stopScanning]
+  );
+
+  // Open file picker
+  const handleSelectFromAlbum = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
 
   // Initialize client once on mount using initial settings from ref
   useEffect(() => {
@@ -269,11 +299,20 @@ export function ACPConnect({
       <div
         className="overflow-hidden transition-all duration-200 ease-out"
         style={{
-          maxHeight: expanded ? contentRef.current?.scrollHeight ?? 200 : 0,
+          maxHeight: expanded ? maxHeight : 0,
           opacity: expanded ? 1 : 0,
         }}
       >
         <div ref={contentRef} className={`px-3 pb-3 pt-1 space-y-3 ${isShaking ? "animate-shake" : ""}`}>
+          {/* Hidden file input for album scanning */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={handleFileSelect}
+            className="hidden"
+          />
+
           {/* QR Scanner View - Portal to body to escape backdrop-blur containing block */}
           {isScanning && createPortal(
             <div className="fixed inset-0 z-50 bg-black flex flex-col">
@@ -289,16 +328,26 @@ export function ACPConnect({
               >
                 <X className="h-5 w-5" />
               </Button>
-              <div className="absolute bottom-8 left-0 right-0 text-center text-sm text-white/80">
-                Point camera at QR code
+              <div className="absolute bottom-16 left-0 right-0 flex flex-col items-center gap-3">
+                <Button
+                  onClick={handleSelectFromAlbum}
+                  variant="secondary"
+                  size="sm"
+                  className="h-9 px-4"
+                >
+                  <Image className="h-4 w-4 mr-2" />
+                  Select from Album
+                </Button>
+                <span className="text-sm text-white/80">
+                  or point camera at QR code
+                </span>
               </div>
             </div>,
             document.body
           )}
 
-          {/* Connection Settings */}
-          {!isScanning && (
-            <div className="space-y-3">
+          {/* Connection Settings - use invisible (not hidden) to preserve scrollHeight for animation */}
+          <div className={`space-y-3 ${isScanning ? "invisible" : ""}`}>
               {/* Server URL */}
               <div className="space-y-1.5">
                 <Label htmlFor="proxy-url">Server</Label>
@@ -401,8 +450,7 @@ export function ACPConnect({
                   />
                 </InputGroup>
               </div>
-            </div>
-          )}
+          </div>
 
           {/* Error Message */}
           {error && (

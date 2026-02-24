@@ -23,6 +23,8 @@ export interface UseQRScannerResult {
   startScanning: () => void;
   /** Stop scanning */
   stopScanning: () => void;
+  /** Scan QR code from a file (e.g., from photo album) */
+  scanFromFile: (file: File) => Promise<void>;
 }
 
 /**
@@ -59,6 +61,25 @@ export function useQRScanner({
       qrScannerRef.current = null;
     }
     setIsScanning(false);
+  }, []);
+
+  // Scan QR code from a file (photo album)
+  const scanFromFile = useCallback(async (file: File) => {
+    try {
+      const result = await QrScanner.scanImage(file, {
+        returnDetailedScanResult: true,
+      });
+
+      const data = JSON.parse(result.data) as QRCodeData;
+      if (data.url && data.token) {
+        onScanRef.current(data);
+      } else {
+        onErrorRef.current?.("Invalid QR code: missing url or token");
+      }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "No QR code found";
+      onErrorRef.current?.(message);
+    }
   }, []);
 
   // Initialize scanner when isScanning becomes true
@@ -137,6 +158,7 @@ export function useQRScanner({
     videoRef,
     startScanning,
     stopScanning,
+    scanFromFile,
   };
 }
 
