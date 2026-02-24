@@ -180,7 +180,7 @@ export function FileExplorer({ client }: FileExplorerProps) {
       // Refresh preview if the selected file changed (use ref to get latest value)
       const currentSelectedFile = selectedFileRef.current;
       if (currentSelectedFile) {
-        const changedFile = changes.find(c => c.path === currentSelectedFile.path && c.event === "change");
+        const changedFile = changes.find(c => c.path === currentSelectedFile.path && c.event === "update");
         if (changedFile) {
           try {
             const content = await client.readFile(currentSelectedFile.path);
@@ -195,7 +195,7 @@ export function FileExplorer({ client }: FileExplorerProps) {
           }
         }
         // Clear selection if file was deleted
-        const deletedFile = changes.find(c => c.path === currentSelectedFile.path && c.event === "unlink");
+        const deletedFile = changes.find(c => c.path === currentSelectedFile.path && c.event === "delete");
         if (deletedFile && isMounted) {
           setSelectedFile(null);
         }

@@ -317,7 +317,7 @@ async function handleNewSession(
     if (state.unsubscribeWatcher) {
       state.unsubscribeWatcher();
     }
-    state.unsubscribeWatcher = startWatcher(sessionCwd, (changes) => {
+    state.unsubscribeWatcher = await startWatcher(sessionCwd, (changes) => {
       send(ws, "file_changes", { changes });
     });
 

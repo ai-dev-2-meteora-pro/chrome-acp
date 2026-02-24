@@ -175,8 +175,15 @@ export interface FileContent {
   mimeType?: string;
 }
 
+/**
+ * File change event from @parcel/watcher
+ * Event types:
+ * - "create": file or directory was created
+ * - "update": file was modified
+ * - "delete": file or directory was deleted
+ */
 export interface FileChange {
-  event: "add" | "addDir" | "change" | "unlink" | "unlinkDir";
+  event: "create" | "update" | "delete";
   path: string; // relative path
 }
 

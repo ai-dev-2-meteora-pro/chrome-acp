@@ -1,23 +1,46 @@
 /**
  * File system utilities for real-time file watching and browsing
+ *
+ * Uses @parcel/watcher for efficient, scalable file watching.
+ * This is the same library used by VS Code, Parcel, Nx, and Nuxt.
+ *
+ * Benefits over chokidar:
+ * - Native C++ implementation with throttling/coalescing in C++
+ * - Automatic Watchman integration for large repos
+ * - Uses FSEvents on macOS, inotify on Linux efficiently
+ * - Handles tens of thousands of files without exhausting inotify limits
  */
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { resolve, relative, sep, basename, extname } from "node:path";
-import chokidar, { type FSWatcher } from "chokidar";
+import * as watcher from "@parcel/watcher";
+import { log } from "./logger.js";
 
-// Ignored patterns for file watching (used by chokidar)
-// Using a function for more reliable matching
-const IGNORED_GLOB_PATTERNS: ((path: string) => boolean) = (path: string) => {
-  const name = basename(path);
-  // Ignore hidden files/directories (starting with .)
-  if (name.startsWith(".")) return true;
-  // Ignore common directories
-  if (name === "node_modules" || name === "dist" || name === "build" || name === "coverage") return true;
-  // Ignore lock files
-  if (name.endsWith(".lock") || name === "bun.lockb" || name === "package-lock.json") return true;
-  return false;
-};
+// Ignored patterns for file watching (glob patterns for @parcel/watcher).
+// Patterns match on relative paths from the watched root.
+// The first pattern matches all hidden files/dirs (.git, .vscode, .idea, etc.)
+const WATCHER_IGNORE_PATTERNS: string[] = [
+  // Hidden files and directories (covers .git, .vscode, .idea, .cache, .next, etc.)
+  "**/.*",
+  "**/.*/**",
+  // Package managers
+  "**/node_modules/**",
+  // Build outputs
+  "**/dist/**",
+  "**/build/**",
+  "**/out/**",
+  "**/coverage/**",
+  // Lock files
+  "**/*.lock",
+  "**/bun.lockb",
+  "**/package-lock.json",
+  "**/yarn.lock",
+  "**/pnpm-lock.yaml",
+  // Temporary directories
+  "**/__pycache__/**",
+  "**/tmp/**",
+  "**/temp/**",
+];
 
 // Ignored names for directory listing (simple string/extension matching)
 const IGNORED_NAMES = new Set([
@@ -70,8 +93,15 @@ export interface FileContent {
   mimeType?: string;
 }
 
+/**
+ * File change event from @parcel/watcher
+ * Event types:
+ * - "create": file or directory was created
+ * - "update": file was modified
+ * - "delete": file or directory was deleted
+ */
 export interface FileChange {
-  event: "add" | "addDir" | "change" | "unlink" | "unlinkDir";
+  event: "create" | "update" | "delete";
   path: string; // relative path
 }
 
@@ -225,88 +255,102 @@ function getMimeType(ext: string): string {
   return types[ext] || "application/octet-stream";
 }
 
-// ============ File Watcher ============
+// ============ File Watcher (@parcel/watcher) ============
 
 export type FileChangeHandler = (changes: FileChange[]) => void;
 
+/**
+ * State for a watched directory.
+ * @parcel/watcher handles multiple subscriptions internally,
+ * but we still track handlers for our own reference counting.
+ */
 interface WatcherState {
-  watcher: FSWatcher;
-  pendingChanges: FileChange[];
-  debounceTimer: ReturnType<typeof setTimeout> | null;
-  handlers: Set<FileChangeHandler>;  // Multiple handlers for multiple clients
+  subscription: watcher.AsyncSubscription;
+  handlers: Set<FileChangeHandler>;
 }
 
 const watchers = new Map<string, WatcherState>();
 
 /**
- * Start watching a directory for file changes.
+ * Start watching a directory for file changes using @parcel/watcher.
+ *
+ * This uses native OS APIs for efficient watching:
+ * - macOS: FSEvents (kernel-level, very efficient)
+ * - Linux: inotify (with smart batching to avoid exhausting limits)
+ * - Windows: ReadDirectoryChangesW
+ * - Watchman: automatically used if installed (best for huge repos)
+ *
+ * Events are throttled and coalesced in C++ for performance during
+ * large filesystem changes (e.g., git checkout, npm install).
+ *
  * Uses reference counting - multiple clients can subscribe to the same root.
  * Returns an unsubscribe function to remove this specific handler.
  */
-export function startWatcher(root: string, handler: FileChangeHandler): () => void {
+export async function startWatcher(root: string, handler: FileChangeHandler): Promise<() => void> {
   const existing = watchers.get(root);
 
   if (existing) {
     // Add handler to existing watcher
     existing.handlers.add(handler);
-    return () => {
-      existing.handlers.delete(handler);
-      // Stop watcher if no more handlers
-      if (existing.handlers.size === 0) {
-        stopWatcher(root);
-      }
-    };
+    return createUnsubscribe(existing.handlers, handler, root);
   }
 
-  // Create new watcher
-  const watcher = chokidar.watch(root, {
-    ignored: IGNORED_GLOB_PATTERNS,
-    ignoreInitial: true,
-    persistent: true,
-    awaitWriteFinish: {
-      stabilityThreshold: 100,
-      pollInterval: 50,
+  // Create new watcher with @parcel/watcher
+  const handlers = new Set<FileChangeHandler>([handler]);
+
+  const subscription = await watcher.subscribe(
+    root,
+    (err, events) => {
+      if (err) {
+        log.error("File watcher error", { root, error: String(err) });
+        return;
+      }
+
+      // Convert @parcel/watcher events to our FileChange format
+      // Events already have: { type: 'create' | 'update' | 'delete', path: string (absolute) }
+      const changes: FileChange[] = events.map((event) => ({
+        event: event.type,
+        path: relative(root, event.path),
+      }));
+
+      // Notify all handlers
+      for (const h of handlers) {
+        h(changes);
+      }
     },
-  });
+    {
+      ignore: WATCHER_IGNORE_PATTERNS,
+    }
+  );
 
   const state: WatcherState = {
-    watcher,
-    pendingChanges: [],
-    debounceTimer: null,
-    handlers: new Set([handler]),
+    subscription,
+    handlers,
   };
 
-  watcher.on("all", (event, filePath) => {
-    // Filter to relevant events
-    if (!["add", "addDir", "change", "unlink", "unlinkDir"].includes(event)) return;
-
-    const relativePath = relative(root, filePath);
-    state.pendingChanges.push({
-      event: event as FileChange["event"],
-      path: relativePath,
-    });
-
-    // Debounce: batch changes within 150ms window
-    if (!state.debounceTimer) {
-      state.debounceTimer = setTimeout(() => {
-        const changes = [...state.pendingChanges];
-        state.pendingChanges = [];
-        state.debounceTimer = null;
-        // Notify all handlers
-        for (const h of state.handlers) {
-          h(changes);
-        }
-      }, 150);
-    }
-  });
-
   watchers.set(root, state);
+  log.debug("File watcher started", { root });
 
-  // Return unsubscribe function
+  return createUnsubscribe(handlers, handler, root);
+}
+
+/**
+ * Create an unsubscribe function for a handler.
+ * Uses fire-and-forget pattern for async cleanup since unsubscribe
+ * callbacks are expected to be synchronous by most APIs.
+ */
+function createUnsubscribe(
+  handlers: Set<FileChangeHandler>,
+  handler: FileChangeHandler,
+  root: string
+): () => void {
   return () => {
-    state.handlers.delete(handler);
-    if (state.handlers.size === 0) {
-      stopWatcher(root);
+    handlers.delete(handler);
+    if (handlers.size === 0) {
+      // Fire-and-forget: cleanup runs async but we don't block the caller
+      stopWatcher(root).catch((err) => {
+        log.error("Failed to stop file watcher", { root, error: String(err) });
+      });
     }
   };
 }
@@ -314,23 +358,20 @@ export function startWatcher(root: string, handler: FileChangeHandler): () => vo
 /**
  * Stop watching a directory (removes all handlers)
  */
-export function stopWatcher(root: string): void {
+export async function stopWatcher(root: string): Promise<void> {
   const state = watchers.get(root);
   if (state) {
-    if (state.debounceTimer) {
-      clearTimeout(state.debounceTimer);
-    }
-    state.watcher.close();
+    await state.subscription.unsubscribe();
     watchers.delete(root);
+    log.debug("File watcher stopped", { root });
   }
 }
 
 /**
  * Stop all watchers
  */
-export function stopAllWatchers(): void {
-  for (const root of watchers.keys()) {
-    stopWatcher(root);
-  }
+export async function stopAllWatchers(): Promise<void> {
+  const roots = Array.from(watchers.keys());
+  await Promise.all(roots.map((root) => stopWatcher(root)));
 }
 
