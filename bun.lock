@@ -34,7 +34,7 @@
     },
     "packages/proxy-server": {
       "name": "@chrome-acp/proxy-server",
-      "version": "1.0.34",
+      "version": "1.0.36",
       "bin": {
         "acp-proxy": "dist/cli/bin.js",
       },

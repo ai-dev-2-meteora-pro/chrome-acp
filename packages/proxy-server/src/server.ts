@@ -66,13 +66,34 @@ interface SessionModelState {
   currentModelId: string;
 }
 
+// AgentCapabilities from ACP protocol
+// Reference: Zed's AcpConnection.agent_capabilities
+// Matches SDK's AgentCapabilities exactly
+interface AgentCapabilities {
+  _meta?: Record<string, unknown> | null;
+  loadSession?: boolean;
+  mcpCapabilities?: {
+    _meta?: Record<string, unknown> | null;
+    clientServers?: boolean;
+  };
+  promptCapabilities?: PromptCapabilities;
+  sessionCapabilities?: {
+    _meta?: Record<string, unknown> | null;
+    fork?: Record<string, unknown> | null;
+    list?: Record<string, unknown> | null;
+    resume?: Record<string, unknown> | null;
+  };
+}
+
 // Track connected clients and their agent connections
 interface ClientState {
   process: ChildProcess | null;
   connection: acp.ClientSideConnection | null;
   sessionId: string | null;
   pendingPermissions: Map<string, PendingPermission>;
-  // Reference: Zed stores promptCapabilities from initialize response
+  // Reference: Zed stores full agentCapabilities from initialize response
+  agentCapabilities: AgentCapabilities | null;
+  // Reference: Zed stores promptCapabilities from initialize response (convenience accessor)
   promptCapabilities: PromptCapabilities | null;
   // Reference: Zed stores model state from NewSessionResponse.models
   modelState: SessionModelState | null;
@@ -253,19 +274,30 @@ async function handleConnect(ws: WSContext): Promise<void> {
       },
     });
 
-    // Reference: Zed stores promptCapabilities from initialize response
-    // to check image support via supports_images()
-    // Note: promptCapabilities is nested in agentCapabilities
-    state.promptCapabilities = initResult.agentCapabilities?.promptCapabilities ?? null;
+    // Reference: Zed stores full agentCapabilities from initialize response
+    // This includes loadSession, promptCapabilities, sessionCapabilities, etc.
+    const agentCaps = initResult.agentCapabilities;
+    state.agentCapabilities = agentCaps ? {
+      _meta: agentCaps._meta,
+      loadSession: agentCaps.loadSession,
+      mcpCapabilities: agentCaps.mcpCapabilities,
+      promptCapabilities: agentCaps.promptCapabilities,
+      sessionCapabilities: agentCaps.sessionCapabilities,
+    } : null;
+    state.promptCapabilities = agentCaps?.promptCapabilities ?? null;
+
     log.info("Agent initialized", {
       protocolVersion: initResult.protocolVersion,
+      loadSession: state.agentCapabilities?.loadSession,
+      sessionList: !!state.agentCapabilities?.sessionCapabilities?.list,
+      sessionResume: !!state.agentCapabilities?.sessionCapabilities?.resume,
       promptCapabilities: state.promptCapabilities,
     });
 
     send(ws, "status", {
       connected: true,
       agentInfo: initResult.agentInfo,
-      capabilities: initResult.agentCapabilities,
+      capabilities: state.agentCapabilities,
     });
 
     // Handle connection close
@@ -340,6 +372,203 @@ async function handleNewSession(
     log.error("Failed to create session", { error: (error as Error).message });
     send(ws, "error", {
       message: `Failed to create session: ${(error as Error).message}`,
+    });
+  }
+}
+
+// ============================================================================
+// Session History Operations
+// Reference: Zed's AgentConnection trait - list_sessions, load_session, resume_session
+// ============================================================================
+
+/**
+ * List sessions from the agent.
+ * Reference: Zed's AcpSessionList.list_sessions()
+ */
+async function handleListSessions(
+  ws: WSContext,
+  params: { cwd?: string; cursor?: string },
+): Promise<void> {
+  const state = clients.get(ws);
+  if (!state?.connection) {
+    send(ws, "error", { message: "Not connected to agent" });
+    return;
+  }
+
+  // Check if agent supports listing sessions
+  // Reference: Zed checks agent_capabilities.session_capabilities.list
+  if (!state.agentCapabilities?.sessionCapabilities?.list) {
+    send(ws, "error", { message: "Listing sessions is not supported by this agent" });
+    return;
+  }
+
+  try {
+    // Note: SDK uses unstable_listSessions until API is finalized
+    const result = await state.connection.unstable_listSessions({
+      cwd: params.cwd,
+      cursor: params.cursor,
+    });
+
+    log.info("Sessions listed", { count: result.sessions.length, hasMore: !!result.nextCursor });
+
+    // Map SDK's SessionInfo to our AgentSessionInfo
+    // Reference: Zed's AgentSessionList.list_sessions maps acp::SessionInfo -> AgentSessionInfo
+    send(ws, "session_list", {
+      sessions: result.sessions.map((s: acp.SessionInfo) => ({
+        _meta: s._meta,
+        cwd: s.cwd,  // Required field in SDK's SessionInfo
+        sessionId: s.sessionId,
+        title: s.title,
+        updatedAt: s.updatedAt,
+      })),
+      nextCursor: result.nextCursor,
+      _meta: result._meta,
+    });
+  } catch (error) {
+    log.error("Failed to list sessions", { error: (error as Error).message });
+    send(ws, "error", {
+      message: `Failed to list sessions: ${(error as Error).message}`,
+    });
+  }
+}
+
+/**
+ * Load an existing session with history replay.
+ * Reference: Zed's AcpConnection.load_session()
+ */
+async function handleLoadSession(
+  ws: WSContext,
+  params: { sessionId: string; cwd?: string },
+): Promise<void> {
+  const state = clients.get(ws);
+  if (!state?.connection) {
+    send(ws, "error", { message: "Not connected to agent" });
+    return;
+  }
+
+  // Check if agent supports loading sessions
+  // Reference: Zed checks agent_capabilities.load_session
+  if (!state.agentCapabilities?.loadSession) {
+    send(ws, "error", { message: "Loading sessions is not supported by this agent" });
+    return;
+  }
+
+  try {
+    const sessionCwd = params.cwd || AGENT_CWD;
+    const result = await state.connection.loadSession({
+      sessionId: params.sessionId,
+      cwd: sessionCwd,
+      mcpServers: [
+        {
+          type: "http",
+          url: `http://localhost:${SERVER_PORT}/mcp`,
+          name: "browser",
+          headers: [],
+        },
+      ],
+    });
+
+    state.sessionId = result.sessionId;
+    state.sessionCwd = sessionCwd;
+    // TODO: Zed also stores result.modes and result.configOptions
+    // Reference: acp.rs line 659-665 - config_state(response.modes, response.models, response.config_options)
+    state.modelState = result.models ?? null;
+    log.info("Session loaded", { sessionId: result.sessionId, cwd: sessionCwd });
+
+    // Restart file watcher with the session cwd
+    if (state.unsubscribeWatcher) {
+      state.unsubscribeWatcher();
+    }
+    state.unsubscribeWatcher = await startWatcher(sessionCwd, (changes) => {
+      send(ws, "file_changes", { changes });
+    });
+
+    // Send fresh root directory listing
+    const rootItems = listDir(sessionCwd, "");
+    if (rootItems !== null) {
+      send(ws, "dir_listing", { path: "", items: rootItems });
+    }
+
+    send(ws, "session_loaded", {
+      sessionId: result.sessionId,
+      promptCapabilities: state.promptCapabilities,
+      models: state.modelState,
+    });
+  } catch (error) {
+    log.error("Failed to load session", { error: (error as Error).message });
+    send(ws, "error", {
+      message: `Failed to load session: ${(error as Error).message}`,
+    });
+  }
+}
+
+/**
+ * Resume an existing session without history replay.
+ * Reference: Zed's AcpConnection.resume_session()
+ */
+async function handleResumeSession(
+  ws: WSContext,
+  params: { sessionId: string; cwd?: string },
+): Promise<void> {
+  const state = clients.get(ws);
+  if (!state?.connection) {
+    send(ws, "error", { message: "Not connected to agent" });
+    return;
+  }
+
+  // Check if agent supports resuming sessions
+  // Reference: Zed checks agent_capabilities.session_capabilities.resume
+  if (!state.agentCapabilities?.sessionCapabilities?.resume) {
+    send(ws, "error", { message: "Resuming sessions is not supported by this agent" });
+    return;
+  }
+
+  try {
+    const sessionCwd = params.cwd || AGENT_CWD;
+    // Note: SDK uses unstable_resumeSession until API is finalized
+    const result = await state.connection.unstable_resumeSession({
+      sessionId: params.sessionId,
+      cwd: sessionCwd,
+      mcpServers: [
+        {
+          type: "http",
+          url: `http://localhost:${SERVER_PORT}/mcp`,
+          name: "browser",
+          headers: [],
+        },
+      ],
+    });
+
+    state.sessionId = result.sessionId;
+    state.sessionCwd = sessionCwd;
+    // TODO: Zed also stores result.modes and result.configOptions
+    // Reference: acp.rs line 736-742 - config_state(response.modes, response.models, response.config_options)
+    state.modelState = result.models ?? null;
+    log.info("Session resumed", { sessionId: result.sessionId, cwd: sessionCwd });
+
+    // Restart file watcher with the session cwd
+    if (state.unsubscribeWatcher) {
+      state.unsubscribeWatcher();
+    }
+    state.unsubscribeWatcher = await startWatcher(sessionCwd, (changes) => {
+      send(ws, "file_changes", { changes });
+    });
+
+    // Send fresh root directory listing
+    const rootItems = listDir(sessionCwd, "");
+    if (rootItems !== null) {
+      send(ws, "dir_listing", { path: "", items: rootItems });
+    }
+
+    send(ws, "session_resumed", {
+      sessionId: result.sessionId,
+      promptCapabilities: state.promptCapabilities,
+      models: state.modelState,
+    });
+  } catch (error) {
+    log.error("Failed to resume session", { error: (error as Error).message });
+    send(ws, "error", {
+      message: `Failed to resume session: ${(error as Error).message}`,
     });
   }
 }
@@ -629,6 +858,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
             connection: null,
             sessionId: null,
             pendingPermissions: new Map(),
+            agentCapabilities: null,
             promptCapabilities: null,
             modelState: null,
             unsubscribeWatcher: null,
@@ -677,6 +907,16 @@ export async function startServer(config: ServerConfig): Promise<void> {
             case "set_session_model":
               // Handle model selection request
               await handleSetSessionModel(ws, data.payload as { modelId: string });
+              break;
+            // Session history operations - Reference: Zed's AgentSessionList
+            case "list_sessions":
+              await handleListSessions(ws, (data.payload as { cwd?: string; cursor?: string }) || {});
+              break;
+            case "load_session":
+              await handleLoadSession(ws, data.payload as { sessionId: string; cwd?: string });
+              break;
+            case "resume_session":
+              await handleResumeSession(ws, data.payload as { sessionId: string; cwd?: string });
               break;
             case "list_dir":
               handleListDir(ws, data.payload as { path: string });

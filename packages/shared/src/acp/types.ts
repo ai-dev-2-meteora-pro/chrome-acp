@@ -94,17 +94,23 @@ export type ProxyMessage =
   | { type: "permission_response"; payload: PermissionResponsePayload }
   | { type: "browser_tool_result"; callId: string; result: BrowserToolResult | { error: string } }
   | { type: "set_session_model"; payload: { modelId: string } }
+  // Session history operations - Reference: Zed's AgentSessionList trait
+  | { type: "list_sessions"; payload?: ListSessionsRequest }
+  | { type: "load_session"; payload: LoadSessionRequest }
+  | { type: "resume_session"; payload: ResumeSessionRequest }
   // File explorer messages
   | { type: "list_dir"; payload: { path: string } }
   | { type: "read_file"; payload: { path: string } };
 
 // Messages received FROM the proxy server
+// Reference: Zed's AgentConnection stores agentCapabilities from initialize response
 export interface ProxyStatusMessage {
   type: "status";
   payload: {
     connected: boolean;
     agentInfo?: { name?: string; version?: string };
-    capabilities?: unknown;
+    /** Full agent capabilities from initialize response */
+    capabilities?: AgentCapabilities;
   };
 }
 
@@ -207,6 +213,46 @@ export interface ProxyFileChangesMessage {
   };
 }
 
+// ============================================================================
+// Session History Response Types
+// Reference: Zed's AgentSessionList in acp_thread/src/connection.rs
+// ============================================================================
+
+/**
+ * Response containing list of sessions.
+ * Reference: Zed's AgentSessionListResponse
+ */
+export interface ProxySessionListMessage {
+  type: "session_list";
+  payload: ListSessionsResponse;
+}
+
+/**
+ * Response when a session is loaded (with history replay).
+ * Reference: Zed's load_session returns Entity<AcpThread>
+ */
+export interface ProxySessionLoadedMessage {
+  type: "session_loaded";
+  payload: {
+    sessionId: string;
+    promptCapabilities?: PromptCapabilities;
+    models?: SessionModelState | null;
+  };
+}
+
+/**
+ * Response when a session is resumed (without history replay).
+ * Reference: Zed's resume_session returns Entity<AcpThread>
+ */
+export interface ProxySessionResumedMessage {
+  type: "session_resumed";
+  payload: {
+    sessionId: string;
+    promptCapabilities?: PromptCapabilities;
+    models?: SessionModelState | null;
+  };
+}
+
 export type ProxyResponse =
   | ProxyStatusMessage
   | ProxyErrorMessage
@@ -218,7 +264,11 @@ export type ProxyResponse =
   | ProxyModelChangedMessage
   | ProxyDirListingMessage
   | ProxyFileContentMessage
-  | ProxyFileChangesMessage;
+  | ProxyFileChangesMessage
+  // Session history responses
+  | ProxySessionListMessage
+  | ProxySessionLoadedMessage
+  | ProxySessionResumedMessage;
 
 // Content block types (matches @agentclientprotocol/sdk ContentBlock)
 // Reference: Zed's acp::ContentBlock in agent-client-protocol crate
@@ -328,6 +378,170 @@ export interface PromptCapabilities {
   audio?: boolean;           // Agent supports audio content
   embeddedContext?: boolean; // Agent supports embedded context in prompts
   image?: boolean;           // Agent supports image content
+}
+
+// ============================================================================
+// Session Capabilities Types (matches @agentclientprotocol/sdk exactly)
+// Reference: Zed's AgentCapabilities in agent_servers/src/acp.rs
+// SDK types: @agentclientprotocol/sdk/dist/schema/types.gen.d.ts
+// ============================================================================
+
+/**
+ * MCP capabilities supported by the agent.
+ * Reference: acp::McpCapabilities
+ */
+export interface McpCapabilities {
+  /** Agent supports client-provided MCP servers */
+  clientServers?: boolean;
+  /** Reserved for extensibility */
+  _meta?: Record<string, unknown> | null;
+}
+
+/**
+ * Session list capability configuration.
+ * Reference: SDK's SessionListCapabilities (note: plural)
+ * @experimental - This capability is not part of the spec yet
+ */
+export interface SessionListCapabilities {
+  /** Reserved for extensibility */
+  _meta?: Record<string, unknown> | null;
+}
+
+/**
+ * Session resume capability configuration.
+ * Reference: SDK's SessionResumeCapabilities (note: plural)
+ * @experimental - This capability is not part of the spec yet
+ */
+export interface SessionResumeCapabilities {
+  /** Reserved for extensibility */
+  _meta?: Record<string, unknown> | null;
+}
+
+/**
+ * Session fork capability configuration.
+ * Reference: SDK's SessionForkCapabilities
+ * @experimental - This capability is not part of the spec yet
+ */
+export interface SessionForkCapabilities {
+  /** Reserved for extensibility */
+  _meta?: Record<string, unknown> | null;
+}
+
+/**
+ * Session capabilities supported by the agent.
+ * Reference: acp::SessionCapabilities
+ *
+ * As a baseline, all Agents MUST support session/new, session/prompt,
+ * session/cancel, and session/update.
+ * Optionally, they MAY support other session methods by specifying
+ * additional capabilities.
+ */
+export interface SessionCapabilities {
+  /** Reserved for extensibility */
+  _meta?: Record<string, unknown> | null;
+  /** @experimental Agent supports forking sessions via session/fork */
+  fork?: SessionForkCapabilities | null;
+  /** @experimental Agent supports listing sessions via session/list */
+  list?: SessionListCapabilities | null;
+  /** @experimental Agent supports resuming sessions via session/resume */
+  resume?: SessionResumeCapabilities | null;
+}
+
+/**
+ * Capabilities supported by the agent.
+ * Advertised during initialization to inform the client about
+ * available features and content types.
+ * Reference: acp::AgentCapabilities
+ */
+export interface AgentCapabilities {
+  /** Reserved for extensibility */
+  _meta?: Record<string, unknown> | null;
+  /** Whether the agent supports session/load */
+  loadSession?: boolean;
+  /** MCP capabilities supported by the agent */
+  mcpCapabilities?: McpCapabilities;
+  /** Prompt capabilities supported by the agent */
+  promptCapabilities?: PromptCapabilities;
+  /** Session capabilities supported by the agent */
+  sessionCapabilities?: SessionCapabilities;
+}
+
+// ============================================================================
+// Session List/Load/Resume Types
+// Reference: Zed's AgentSessionInfo, AgentSessionList in acp_thread/src/connection.rs
+// SDK types: @agentclientprotocol/sdk SessionInfo, ListSessionsResponse
+// ============================================================================
+
+/**
+ * Information about an existing session.
+ * Returned by session/list and used for load/resume operations.
+ * Reference: acp::SessionInfo (SDK), Zed's AgentSessionInfo
+ * Note: SDK's SessionInfo has cwd as REQUIRED, but Zed's AgentSessionInfo has it optional
+ * We follow SDK here for protocol compatibility
+ */
+export interface AgentSessionInfo {
+  /** Reserved for extensibility */
+  _meta?: Record<string, unknown> | null;
+  /** Working directory for the session (required per SDK) */
+  cwd: string;
+  /** Unique identifier for the session */
+  sessionId: string;
+  /** Human-readable title for the session */
+  title?: string | null;
+  /** ISO 8601 timestamp when the session was last updated */
+  updatedAt?: string | null;
+}
+
+/**
+ * Request to list sessions.
+ * Reference: acp::ListSessionsRequest
+ */
+export interface ListSessionsRequest {
+  /** Reserved for extensibility */
+  _meta?: Record<string, unknown> | null;
+  /** Filter sessions by working directory */
+  cwd?: string;
+  /** Pagination cursor for fetching more results */
+  cursor?: string;
+}
+
+/**
+ * Response from listing sessions.
+ * Reference: acp::ListSessionsResponse (SDK)
+ */
+export interface ListSessionsResponse {
+  /** Reserved for extensibility */
+  _meta?: Record<string, unknown> | null;
+  /** Cursor for fetching the next page of results */
+  nextCursor?: string | null;
+  /** Array of session info objects */
+  sessions: AgentSessionInfo[];
+}
+
+/**
+ * Request to load an existing session.
+ * Reference: acp::LoadSessionRequest
+ */
+export interface LoadSessionRequest {
+  /** Reserved for extensibility */
+  _meta?: Record<string, unknown> | null;
+  /** Session ID to load */
+  sessionId: string;
+  /** Working directory for the session */
+  cwd?: string;
+}
+
+/**
+ * Request to resume an existing session without replaying history.
+ * Reference: acp::ResumeSessionRequest
+ */
+export interface ResumeSessionRequest {
+  /** Reserved for extensibility */
+  _meta?: Record<string, unknown> | null;
+  /** Session ID to resume */
+  sessionId: string;
+  /** Working directory for the session */
+  cwd?: string;
 }
 
 // ============================================================================

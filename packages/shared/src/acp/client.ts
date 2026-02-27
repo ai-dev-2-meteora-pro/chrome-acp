@@ -1,13 +1,19 @@
 import type {
   ACPSettings,
+  AgentCapabilities,
+  AgentSessionInfo,
   BrowserToolParams,
   BrowserToolResult,
   ConnectionState,
   ContentBlock,
+  ListSessionsRequest,
+  ListSessionsResponse,
+  LoadSessionRequest,
   PermissionRequestPayload,
   PromptCapabilities,
   ProxyMessage,
   ProxyResponse,
+  ResumeSessionRequest,
   SessionUpdate,
   SessionModelState,
   ModelInfo,
@@ -43,12 +49,17 @@ export type ModelStateChangedHandler = (state: SessionModelState | null) => void
 export type FileChangesHandler = (changes: FileChange[]) => void;
 // Handler for server-pushed directory listings (e.g., after session cwd change)
 export type DirListingPushHandler = (path: string, items: FileItem[]) => void;
+// Handler for session loaded/resumed events
+export type SessionLoadedHandler = (sessionId: string) => void;
 
 export class ACPClient {
   private ws: WebSocket | null = null;
   private settings: ACPSettings;
   private connectionState: ConnectionState = "disconnected";
   private sessionId: string | null = null;
+  // Reference: Zed stores full agentCapabilities from initialize response
+  // Used to check supports_load_session, supports_resume_session, etc.
+  private _agentCapabilities: AgentCapabilities | null = null;
   // Reference: Zed's prompt_capabilities in MessageEditor
   // Stores capabilities from agent's initialize response
   private _promptCapabilities: PromptCapabilities | null = null;
@@ -56,6 +67,7 @@ export class ACPClient {
   private _modelState: SessionModelState | null = null;
   private onModelChanged: ModelChangedHandler | null = null;
   private onModelStateChanged: ModelStateChangedHandler | null = null;
+  private onSessionLoaded: SessionLoadedHandler | null = null;
 
   private onConnectionStateChange: ConnectionStateHandler | null = null;
   private onSessionUpdate: SessionUpdateHandler | null = null;
@@ -70,6 +82,10 @@ export class ACPClient {
   private requestIdCounter = 0;
   private pendingDirListing: Map<number, { resolve: (items: FileItem[]) => void; reject: (err: Error) => void }> = new Map();
   private pendingFileRead: Map<number, { resolve: (content: FileContent) => void; reject: (err: Error) => void }> = new Map();
+  // Pending session operations
+  private pendingSessionList: { resolve: (response: ListSessionsResponse) => void; reject: (err: Error) => void } | null = null;
+  private pendingSessionLoad: { resolve: (sessionId: string) => void; reject: (err: Error) => void } | null = null;
+  private pendingSessionResume: { resolve: (sessionId: string) => void; reject: (err: Error) => void } | null = null;
   // Track requestId for each path to match responses
   private dirListingRequestIds: Map<string, number> = new Map();
   private fileReadRequestIds: Map<string, number> = new Map();
@@ -174,6 +190,53 @@ export class ACPClient {
     return this._modelState !== null && this._modelState.availableModels.length > 0;
   }
 
+  // ============================================================================
+  // Session Capability Getters
+  // Reference: Zed's AgentConnection supports_* methods
+  // ============================================================================
+
+  /**
+   * Get the full agent capabilities.
+   * Reference: Zed's AcpConnection.agent_capabilities
+   */
+  get agentCapabilities(): AgentCapabilities | null {
+    return this._agentCapabilities;
+  }
+
+  /**
+   * Check if the agent supports loading existing sessions.
+   * Reference: Zed's AcpConnection.supports_load_session()
+   */
+  get supportsLoadSession(): boolean {
+    return this._agentCapabilities?.loadSession === true;
+  }
+
+  /**
+   * Check if the agent supports resuming existing sessions.
+   * Reference: Zed's AcpConnection.supports_resume_session()
+   */
+  get supportsResumeSession(): boolean {
+    return this._agentCapabilities?.sessionCapabilities?.resume !== undefined
+      && this._agentCapabilities?.sessionCapabilities?.resume !== null;
+  }
+
+  /**
+   * Check if the agent supports listing sessions.
+   * Reference: Zed checks agent_capabilities.session_capabilities.list
+   */
+  get supportsSessionList(): boolean {
+    return this._agentCapabilities?.sessionCapabilities?.list !== undefined
+      && this._agentCapabilities?.sessionCapabilities?.list !== null;
+  }
+
+  /**
+   * Check if the agent supports session history (load or resume).
+   * Reference: Zed's AgentConnection.supports_session_history()
+   */
+  get supportsSessionHistory(): boolean {
+    return this.supportsLoadSession || this.supportsResumeSession;
+  }
+
   async connect(): Promise<void> {
     if (this.ws) {
       this.disconnect();
@@ -260,6 +323,8 @@ export class ACPClient {
     switch (response.type) {
       case "status":
         if (response.payload.connected) {
+          // Reference: Zed stores full agentCapabilities from status message
+          this._agentCapabilities = response.payload.capabilities ?? null;
           this.setState("connected");
           this.connectResolve?.();
         } else {
@@ -271,6 +336,13 @@ export class ACPClient {
 
       case "error":
         console.error("[ACPClient] Error:", response.payload.message);
+        // Reject pending session operations if any
+        this.pendingSessionList?.reject(new Error(response.payload.message));
+        this.pendingSessionList = null;
+        this.pendingSessionLoad?.reject(new Error(response.payload.message));
+        this.pendingSessionLoad = null;
+        this.pendingSessionResume?.reject(new Error(response.payload.message));
+        this.pendingSessionResume = null;
         this.connectReject?.(new Error(response.payload.message));
         this.connectResolve = null;
         this.connectReject = null;
@@ -285,6 +357,35 @@ export class ACPClient {
         console.log("[ACPClient] Session created, promptCapabilities:", this._promptCapabilities, "models:", this._modelState);
         this.onSessionCreated?.(response.payload.sessionId);
         // Notify model state subscribers (replaces polling in useModels)
+        this.onModelStateChanged?.(this._modelState);
+        break;
+
+      // Session history responses - Reference: Zed's AgentSessionList
+      case "session_list":
+        console.log("[ACPClient] Session list received:", response.payload.sessions.length, "sessions");
+        this.pendingSessionList?.resolve(response.payload);
+        this.pendingSessionList = null;
+        break;
+
+      case "session_loaded":
+        this.sessionId = response.payload.sessionId;
+        this._promptCapabilities = response.payload.promptCapabilities ?? null;
+        this._modelState = response.payload.models ?? null;
+        console.log("[ACPClient] Session loaded:", response.payload.sessionId);
+        this.pendingSessionLoad?.resolve(response.payload.sessionId);
+        this.pendingSessionLoad = null;
+        this.onSessionLoaded?.(response.payload.sessionId);
+        this.onModelStateChanged?.(this._modelState);
+        break;
+
+      case "session_resumed":
+        this.sessionId = response.payload.sessionId;
+        this._promptCapabilities = response.payload.promptCapabilities ?? null;
+        this._modelState = response.payload.models ?? null;
+        console.log("[ACPClient] Session resumed:", response.payload.sessionId);
+        this.pendingSessionResume?.resolve(response.payload.sessionId);
+        this.pendingSessionResume = null;
+        this.onSessionLoaded?.(response.payload.sessionId);
         this.onModelStateChanged?.(this._modelState);
         break;
 
@@ -442,6 +543,105 @@ export class ACPClient {
   }
 
   // ============================================================================
+  // Session History Methods
+  // Reference: Zed's AgentSessionList trait and AgentConnection methods
+  // ============================================================================
+
+  /**
+   * Set handler for session loaded/resumed events.
+   */
+  setSessionLoadedHandler(handler: SessionLoadedHandler): void {
+    this.onSessionLoaded = handler;
+  }
+
+  /**
+   * List existing sessions from the agent.
+   * Reference: Zed's AcpSessionList.list_sessions()
+   * @throws Error if agent doesn't support session listing
+   */
+  async listSessions(request?: ListSessionsRequest): Promise<ListSessionsResponse> {
+    if (!this.supportsSessionList) {
+      throw new Error("Listing sessions is not supported by this agent");
+    }
+    return new Promise((resolve, reject) => {
+      this.pendingSessionList = { resolve, reject };
+      try {
+        this.send({ type: "list_sessions", payload: request });
+      } catch (err) {
+        this.pendingSessionList = null;
+        reject(err);
+        return;
+      }
+      // Timeout after 30 seconds
+      setTimeout(() => {
+        if (this.pendingSessionList) {
+          const pending = this.pendingSessionList;
+          this.pendingSessionList = null;
+          pending.reject(new Error("List sessions timed out"));
+        }
+      }, 30000);
+    });
+  }
+
+  /**
+   * Load an existing session with history replay.
+   * Reference: Zed's AcpConnection.load_session()
+   * @throws Error if agent doesn't support session loading
+   */
+  async loadSession(request: LoadSessionRequest): Promise<string> {
+    if (!this.supportsLoadSession) {
+      throw new Error("Loading sessions is not supported by this agent");
+    }
+    return new Promise((resolve, reject) => {
+      this.pendingSessionLoad = { resolve, reject };
+      try {
+        this.send({ type: "load_session", payload: request });
+      } catch (err) {
+        this.pendingSessionLoad = null;
+        reject(err);
+        return;
+      }
+      // Timeout after 60 seconds (loading may take time for large sessions)
+      setTimeout(() => {
+        if (this.pendingSessionLoad) {
+          const pending = this.pendingSessionLoad;
+          this.pendingSessionLoad = null;
+          pending.reject(new Error("Load session timed out"));
+        }
+      }, 60000);
+    });
+  }
+
+  /**
+   * Resume an existing session without history replay.
+   * Reference: Zed's AcpConnection.resume_session()
+   * @throws Error if agent doesn't support session resuming
+   */
+  async resumeSession(request: ResumeSessionRequest): Promise<string> {
+    if (!this.supportsResumeSession) {
+      throw new Error("Resuming sessions is not supported by this agent");
+    }
+    return new Promise((resolve, reject) => {
+      this.pendingSessionResume = { resolve, reject };
+      try {
+        this.send({ type: "resume_session", payload: request });
+      } catch (err) {
+        this.pendingSessionResume = null;
+        reject(err);
+        return;
+      }
+      // Timeout after 30 seconds
+      setTimeout(() => {
+        if (this.pendingSessionResume) {
+          const pending = this.pendingSessionResume;
+          this.pendingSessionResume = null;
+          pending.reject(new Error("Resume session timed out"));
+        }
+      }, 30000);
+    });
+  }
+
+  // ============================================================================
   // File Explorer Methods
   // ============================================================================
 
@@ -533,10 +733,11 @@ export class ACPClient {
     this.setState("disconnected");
     this.sessionId = null;
     this._modelState = null;
+    this._agentCapabilities = null;
     // Notify model state subscribers that session is gone
     this.onModelStateChanged?.(null);
 
-    // Reject all pending file operations before clearing
+    // Reject all pending operations before clearing
     const disconnectError = new Error("Disconnected");
     for (const { reject } of this.pendingDirListing.values()) {
       reject(disconnectError);
@@ -544,6 +745,14 @@ export class ACPClient {
     for (const { reject } of this.pendingFileRead.values()) {
       reject(disconnectError);
     }
+    // Reject pending session operations
+    this.pendingSessionList?.reject(disconnectError);
+    this.pendingSessionList = null;
+    this.pendingSessionLoad?.reject(disconnectError);
+    this.pendingSessionLoad = null;
+    this.pendingSessionResume?.reject(disconnectError);
+    this.pendingSessionResume = null;
+
     this.pendingDirListing.clear();
     this.pendingFileRead.clear();
     this.dirListingRequestIds.clear();
