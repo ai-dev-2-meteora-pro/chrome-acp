@@ -66,8 +66,13 @@ export class AgentProcess {
       `[Agent] Spawning: cmd: "${parsed.cmd}" args: [${fullArgs.map((a) => `"${a}"`).join(", ")}]`,
     );
 
+    // Clean env: remove CLAUDECODE to prevent "nested session" error
+    const env = { ...process.env };
+    delete env.CLAUDECODE;
+
     this.process = spawn(parsed.cmd, fullArgs, {
       cwd,
+      env,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
