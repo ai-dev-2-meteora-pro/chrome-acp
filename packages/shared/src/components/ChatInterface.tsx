@@ -245,6 +245,7 @@ export function ChatInterface({ client }: ChatInterfaceProps) {
   const [agentInfo, setAgentInfo] = useState<{ name?: string; version?: string } | null>(null);
   const [currentModelId, setCurrentModelId] = useState<string | null>(null);
   const [agentMode, setAgentMode] = useState<AgentMode>("code");
+  const [totalChars, setTotalChars] = useState(0);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -335,6 +336,7 @@ export function ChatInterface({ client }: ChatInterfaceProps) {
     if (update.sessionUpdate === "agent_message_chunk") {
       const text = update.content.type === "text" && update.content.text ? update.content.text : "";
       if (!text) return;
+      setTotalChars(prev => prev + text.length);
 
       setEntries((prev) => {
         const lastEntry = prev[prev.length - 1];
@@ -734,6 +736,9 @@ export function ChatInterface({ client }: ChatInterfaceProps) {
 
     try {
       // Reference: Zed's AcpThread.send() forwards Vec<acp::ContentBlock>
+      // Count user input chars for token estimation
+      const userChars = contentBlocks.reduce((sum, b) => sum + (b.type === "text" ? b.text.length : 0), 0);
+      setTotalChars(prev => prev + userChars);
       await client.sendPrompt(contentBlocks);
     } catch (error) {
       console.error("[ChatInterface] Failed to send prompt:", error);
@@ -1083,11 +1088,7 @@ export function ChatInterface({ client }: ChatInterfaceProps) {
         modelId={currentModelId ?? client.modelState?.currentModelId ?? null}
         sessionId={activeSessionId}
         connected={sessionReady}
-        totalChars={entries.reduce((sum, e) => {
-          if (e.type === "user") return sum + (e.text?.length ?? 0);
-          if (e.type === "assistant") return sum + e.chunks.reduce((s, c) => s + (c.text?.length ?? 0), 0);
-          return sum;
-        }, 0)}
+        totalChars={totalChars}
         mode={agentMode}
         onModeChange={(mode) => {
           setAgentMode(mode);
