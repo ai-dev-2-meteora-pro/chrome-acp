@@ -1,6 +1,5 @@
 "use client";
 
-import { SlashCommandsPopup } from "./slash-commands";
 import { Button } from "../ui/button";
 import {
   Command,
@@ -874,42 +873,9 @@ export const PromptInputTextarea = ({
   const controller = useOptionalPromptInputController();
   const attachments = usePromptInputAttachments();
   const [isComposing, setIsComposing] = useState(false);
-  const [showSlashCommands, setShowSlashCommands] = useState(false);
-  const [slashQuery, setSlashQuery] = useState("");
-
-  // Check if current input starts with "/" to show slash commands
-  const currentValue = controller?.textInput.value ?? "";
-
-  useEffect(() => {
-    if (currentValue.startsWith("/") && !currentValue.includes(" ")) {
-      setShowSlashCommands(true);
-      setSlashQuery(currentValue.slice(1));
-    } else {
-      setShowSlashCommands(false);
-      setSlashQuery("");
-    }
-  }, [currentValue]);
-
-  const handleSlashSelect = useCallback(
-    (command: string) => {
-      if (controller) {
-        controller.textInput.setInput(command + " ");
-      }
-      setShowSlashCommands(false);
-    },
-    [controller]
-  );
 
   const handleKeyDown: KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
-    // Let slash commands popup handle navigation keys
-    if (showSlashCommands && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Tab" || e.key === "Escape")) {
-      return; // handled by SlashCommandsPopup
-    }
-
     if (e.key === "Enter") {
-      if (showSlashCommands) {
-        return; // handled by SlashCommandsPopup
-      }
       if (isComposing || e.nativeEvent.isComposing) {
         return;
       }
@@ -982,15 +948,7 @@ export const PromptInputTextarea = ({
       };
 
   return (
-    <div className="relative">
-      {showSlashCommands && (
-        <SlashCommandsPopup
-          query={slashQuery}
-          onSelect={handleSlashSelect}
-          onClose={() => setShowSlashCommands(false)}
-        />
-      )}
-      <InputGroupTextarea
+    <InputGroupTextarea
         className={cn("field-sizing-content max-h-48 min-h-16", className)}
         name="message"
         onCompositionEnd={() => setIsComposing(false)}
@@ -1000,8 +958,7 @@ export const PromptInputTextarea = ({
         placeholder={placeholder}
         {...props}
         {...controlledProps}
-      />
-    </div>
+    />
   );
 };
 

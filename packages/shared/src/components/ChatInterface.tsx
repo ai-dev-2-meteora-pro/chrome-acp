@@ -104,6 +104,7 @@ import {
   ReasoningContent,
 } from "./ai-elements/reasoning";
 import { ToolPermissionButtons } from "./ai-elements/permission-request";
+import { SlashCommandButton } from "./ai-elements/slash-commands";
 
 // =============================================================================
 // Type Definitions - Flat Entry Structure (matching Zed's architecture)
@@ -1019,8 +1020,18 @@ export function ChatInterface({ client }: ChatInterfaceProps) {
             disabled={!sessionReady}
           />
           <PromptInputFooter>
-            {/* Left side: Model selector and image button */}
+            {/* Left side: Slash commands, Model selector and image button */}
             <div className="flex items-center gap-1">
+              <SlashCommandButton onSelect={(cmd) => {
+                // Insert command into textarea via DOM
+                const textarea = document.querySelector('textarea[name="message"]') as HTMLTextAreaElement;
+                if (textarea) {
+                  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                  nativeSetter?.call(textarea, cmd + " ");
+                  textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                  textarea.focus();
+                }
+              }} />
               {/* Reference: Zed's AcpModelSelectorPopover in message editor footer */}
               <ModelSelectorPopover client={client} />
               {/* Reference: Zed's add_images_from_picker() shows image picker button only when supported */}
