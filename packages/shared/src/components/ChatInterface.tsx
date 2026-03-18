@@ -105,6 +105,7 @@ import {
 } from "./ai-elements/reasoning";
 import { ToolPermissionButtons } from "./ai-elements/permission-request";
 import { SlashCommandButton } from "./ai-elements/slash-commands";
+import { StatusBar, type AgentMode } from "./ai-elements/status-bar";
 
 // =============================================================================
 // Type Definitions - Flat Entry Structure (matching Zed's architecture)
@@ -240,6 +241,10 @@ export function ChatInterface({ client }: ChatInterfaceProps) {
   const activeSessionIdRef = useRef<string | null>(null);
   // Reference: Zed's supports_images() checks prompt_capabilities.image
   const [supportsImages, setSupportsImages] = useState(false);
+  // Status bar state
+  const [agentInfo, setAgentInfo] = useState<{ name?: string; version?: string } | null>(null);
+  const [currentModelId, setCurrentModelId] = useState<string | null>(null);
+  const [agentMode, setAgentMode] = useState<AgentMode>("code");
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -534,7 +539,12 @@ export function ChatInterface({ client }: ChatInterfaceProps) {
   useEffect(() => {
     client.setSessionCreatedHandler((sessionId) => {
       console.log("[ChatInterface] Session created:", sessionId);
+      setAgentInfo(client.agentInfo);
       activateSession(sessionId);
+    });
+
+    client.setModelChangedHandler((modelId) => {
+      setCurrentModelId(modelId);
     });
 
     client.setSessionLoadedHandler((sessionId) => {
@@ -1066,6 +1076,29 @@ export function ChatInterface({ client }: ChatInterfaceProps) {
           </PromptInputFooter>
         </PromptInput>
       </div>
+
+      {/* Status bar */}
+      <StatusBar
+        agentInfo={agentInfo}
+        modelId={currentModelId ?? client.modelState?.currentModelId ?? null}
+        sessionId={activeSessionId}
+        connected={sessionReady}
+        totalChars={entries.reduce((sum, e) => {
+          if (e.type === "user") return sum + (e.text?.length ?? 0);
+          if (e.type === "assistant") return sum + e.chunks.reduce((s, c) => s + (c.text?.length ?? 0), 0);
+          return sum;
+        }, 0)}
+        mode={agentMode}
+        onModeChange={(mode) => {
+          setAgentMode(mode);
+          // Send mode hint as system message
+          if (mode === "plan") {
+            client.sendPrompt([{ type: "text", text: "/plan" }]);
+          } else if (mode === "bypass") {
+            client.sendPrompt([{ type: "text", text: "From now on, skip all confirmations and execute tools directly." }]);
+          }
+        }}
+      />
     </div>
   );
 }

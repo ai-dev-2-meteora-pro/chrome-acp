@@ -65,6 +65,7 @@ export class ACPClient {
   // Reference: Zed stores full agentCapabilities from initialize response
   // Used to check supports_load_session, supports_resume_session, etc.
   private _agentCapabilities: AgentCapabilities | null = null;
+  private _agentInfo: { name?: string; version?: string } | null = null;
   // Reference: Zed's prompt_capabilities in MessageEditor
   // Stores capabilities from agent's initialize response
   private _promptCapabilities: PromptCapabilities | null = null;
@@ -177,6 +178,10 @@ export class ACPClient {
   // Returns true if the agent supports image content in prompts
   get supportsImages(): boolean {
     return this._promptCapabilities?.image === true;
+  }
+
+  get agentInfo(): { name?: string; version?: string } | null {
+    return this._agentInfo;
   }
 
   // Reference: Zed's prompt_capabilities in MessageEditor
@@ -335,6 +340,7 @@ export class ACPClient {
         if (response.payload.connected) {
           // Reference: Zed stores full agentCapabilities from status message
           this._agentCapabilities = response.payload.capabilities ?? null;
+          this._agentInfo = response.payload.agentInfo ?? null;
           this.setState("connected");
           this.connectResolve?.();
         } else {
