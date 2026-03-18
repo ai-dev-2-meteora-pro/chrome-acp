@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createServer as createHttpsServer } from "node:https";
 import { Writable, Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -295,9 +295,23 @@ async function handleConnect(ws: WSContext): Promise<void> {
       mcpCapabilities: state.agentCapabilities?.mcpCapabilities,
     });
 
+    // Enrich agentInfo with underlying Claude Code version if available
+    let enrichedAgentInfo = initResult.agentInfo;
+    try {
+      const claudeVersion = execSync("claude --version 2>/dev/null", { timeout: 3000 })
+        .toString().trim().split(" ")[0];
+      if (claudeVersion && enrichedAgentInfo) {
+        enrichedAgentInfo = {
+          ...enrichedAgentInfo,
+          name: `Claude Code`,
+          version: claudeVersion,
+        };
+      }
+    } catch { /* claude not available, use ACP adapter info */ }
+
     send(ws, "status", {
       connected: true,
-      agentInfo: initResult.agentInfo,
+      agentInfo: enrichedAgentInfo,
       capabilities: state.agentCapabilities,
     });
 
