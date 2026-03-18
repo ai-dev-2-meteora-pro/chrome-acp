@@ -90,7 +90,7 @@ export const SlashCommandButton = ({
       </button>
 
       {open && (
-        <div className="absolute bottom-full left-0 mb-2 z-50 w-80 bg-popover border rounded-lg shadow-lg overflow-hidden">
+        <div className="fixed bottom-20 left-4 z-50 w-80 bg-popover border rounded-lg shadow-lg overflow-hidden">
           {/* Filter input */}
           <div className="p-2 border-b">
             <input
